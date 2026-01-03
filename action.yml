@@ -1,0 +1,249 @@
+name: "Coverage Gate (overall + diff)"
+description: "Checks overall and PR diff coverage from a Cobertura XML report (coverage.xml). Optionally publishes PR check-runs."
+author: "The EnsembleIP AI Lab"
+
+inputs:
+  coverage-xml:
+    description: "Path to Cobertura XML coverage report (e.g. coverage.xml)."
+    required: false
+    default: "coverage.xml"
+  min-coverage:
+    description: "Minimum required overall coverage percentage (0-100)."
+    required: true
+  min-diff-coverage:
+    description: "Minimum required coverage percentage for changed Python files (0-100). If empty, diff coverage is skipped."
+    required: false
+    default: ""
+  changed-files-glob:
+    description: "Glob(s) used to detect changed files (diff coverage). Only used for pull_request events. Can be a single glob or multiple globs (newline-separated)."
+    required: false
+    default: |
+      src/*.py
+      src/**/*.py
+  publish-checks:
+    description: "If true, publish results to the PR checks list via the Checks API."
+    required: false
+    default: "true"
+  check-name-overall:
+    description: "Name for the overall coverage check-run."
+    required: false
+    default: "coverage (overall)"
+  check-name-diff:
+    description: "Name for the diff coverage check-run."
+    required: false
+    default: "coverage (diff)"
+  github-token:
+    description: "GitHub token used to publish check-runs."
+    required: false
+    default: ${{ github.token }}
+
+outputs:
+  coverage:
+    description: "Overall coverage percentage (min of line and branch coverage)."
+    value: ${{ steps.overall.outputs.coverage }}
+  line_coverage:
+    description: "Overall line coverage percentage."
+    value: ${{ steps.overall.outputs.line_coverage }}
+  branch_coverage:
+    description: "Overall branch coverage percentage."
+    value: ${{ steps.overall.outputs.branch_coverage }}
+  diff_coverage:
+    description: "Diff coverage percentage for changed files (if computed)."
+    value: ${{ steps.diff.outputs.diff_coverage }}
+  changed_files_count:
+    description: "Count of changed files matched by the glob (PR only)."
+    value: ${{ steps.changed-json.outputs.count }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Setup Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.x"
+
+    - name: Determine changed files (PR only)
+      id: changed
+      if: ${{ github.event_name == 'pull_request' && inputs.min-diff-coverage != '' }}
+      uses: tj-actions/changed-files@v45
+      with:
+        json: true
+        files: ${{ inputs.changed-files-glob }}
+
+    - name: Prepare changed files JSON (PR only)
+      id: changed-json
+      if: ${{ github.event_name == 'pull_request' && inputs.min-diff-coverage != '' }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        CHANGED_RAW='${{ steps.changed.outputs.all_changed_files }}'
+        if [[ -z "${CHANGED_RAW}" ]]; then
+          CHANGED_RAW='[]'
+        fi
+        CHANGED_JSON_PATH="${RUNNER_TEMP}/changed_files.json"
+        export CHANGED_RAW
+        export CHANGED_JSON_PATH
+        python - <<'PY' >> "${GITHUB_OUTPUT}"
+        import json
+        import os
+        from pathlib import Path
+
+        raw = os.environ.get("CHANGED_RAW", "") or "[]"
+        path = os.environ.get("CHANGED_JSON_PATH", "")
+
+        def loads_relaxed(s: str):
+          try:
+            return json.loads(s)
+          except json.JSONDecodeError:
+            p = s.strip()
+            # Common GitHub Actions escaping: [\"a.py\",\"b.py\"]  ->  ["a.py","b.py"]
+            if '\\"' in p and p.startswith("["):
+              return json.loads(p.replace('\\"', '"'))
+            # Double-encoded JSON string: "[\"a.py\",\"b.py\"]"
+            if p.startswith('"') and p.endswith('"'):
+              return json.loads(json.loads(p))
+            raise
+
+        try:
+          data = loads_relaxed(raw)
+        except Exception:
+          data = []
+
+        if isinstance(data, dict) and "files" in data:
+          data = data["files"]
+        if not isinstance(data, list):
+          data = []
+
+        data = [x for x in data if isinstance(x, str)]
+
+        if path:
+          Path(path).write_text(json.dumps(data), encoding="utf-8")
+
+        print(f"count={len(data)}")
+        PY
+        echo "::group::changed_files.json (input to diff coverage)"
+        cat "${CHANGED_JSON_PATH}"
+        echo "::endgroup::"
+        echo "path=${CHANGED_JSON_PATH}" >> "${GITHUB_OUTPUT}"
+
+    - name: Debug changed-files outputs (PR only)
+      if: ${{ github.event_name == 'pull_request' && inputs.min-diff-coverage != '' }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        echo "::group::tj-actions/changed-files@v45 outputs"
+        printf '%s\n' '${{ toJson(steps.changed.outputs) }}'
+        echo "::endgroup::"
+
+    - name: Check overall coverage
+      id: overall
+      shell: bash
+      run: |
+        set -euo pipefail
+        python "${GITHUB_ACTION_PATH}/scripts/check_coverage.py" "${{ inputs.coverage-xml }}" "${{ inputs.min-coverage }}"
+
+    - name: Check diff coverage (PR only)
+      id: diff
+      if: ${{ github.event_name == 'pull_request' && inputs.min-diff-coverage != '' }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        python "${GITHUB_ACTION_PATH}/scripts/check_diff_coverage.py" \
+          "${{ inputs.coverage-xml }}" \
+          "${{ steps.changed-json.outputs.path }}" \
+          "${{ inputs.min-diff-coverage }}"
+
+    - name: Publish coverage check-runs (optional)
+      if: ${{ always() && inputs.publish-checks == 'true' }}
+      uses: actions/github-script@v7
+      env:
+        CHECK_NAME_OVERALL: ${{ inputs.check-name-overall }}
+        CHECK_NAME_DIFF: ${{ inputs.check-name-diff }}
+        OVERALL_COVERAGE: ${{ steps.overall.outputs.coverage }}
+        MIN_COVERAGE: ${{ inputs.min-coverage }}
+        OVERALL_OUTCOME: ${{ steps.overall.outcome }}
+        DIFF_COVERAGE: ${{ steps.diff.outputs.diff_coverage }}
+        MIN_DIFF_COVERAGE: ${{ inputs.min-diff-coverage }}
+        DIFF_OUTCOME: ${{ steps.diff.outcome }}
+        CHANGED_FILES_RAW: ${{ steps.changed.outputs.all_changed_files }}
+      with:
+        github-token: ${{ inputs.github-token }}
+        script: |
+          const owner = context.repo.owner;
+          const repo = context.repo.repo;
+          const sha = context.payload.pull_request ? context.payload.pull_request.head.sha : context.sha;
+
+          function conclusionFromOutcome(outcome) {
+            if (outcome === "success") return "success";
+            if (outcome === "failure") return "failure";
+            if (outcome === "cancelled") return "cancelled";
+            if (outcome === "skipped") return "skipped";
+            return "neutral";
+          }
+
+          async function upsertCheck({ name, title, summary, conclusion }) {
+            const { data } = await github.rest.checks.listForRef({ owner, repo, ref: sha });
+            const existing = data.check_runs.find(
+              (cr) => cr.name === name && cr.app && cr.app.slug === "github-actions"
+            );
+            const payload = {
+              owner,
+              repo,
+              name,
+              head_sha: sha,
+              status: "completed",
+              conclusion,
+              output: { title, summary },
+            };
+            if (existing) {
+              await github.rest.checks.update({ ...payload, check_run_id: existing.id });
+            } else {
+              await github.rest.checks.create(payload);
+            }
+          }
+
+          // Overall
+          {
+            const name = (process.env.CHECK_NAME_OVERALL || "coverage (overall)").trim();
+            const cov = (process.env.OVERALL_COVERAGE || "").trim();
+            const min = (process.env.MIN_COVERAGE || "").trim();
+            const outcome = (process.env.OVERALL_OUTCOME || "").trim();
+            const conclusion = conclusionFromOutcome(outcome);
+
+            const hasCov = cov.length > 0;
+            const title = hasCov ? `Overall coverage ${cov}% (target ${min}%)` : "Overall coverage: unavailable";
+            const summary = hasCov
+              ? `Overall coverage: **${cov}%**\n\nMinimum required: **${min}%**\n\nOutcome: **${outcome}**`
+              : `No coverage output was produced by the coverage step.\n\nOutcome: **${outcome}**`;
+            await upsertCheck({ name, title, summary, conclusion });
+          }
+
+          // Diff (optional)
+          {
+            const min = (process.env.MIN_DIFF_COVERAGE || "").trim();
+            if (!min) return;
+
+            const name = (process.env.CHECK_NAME_DIFF || "coverage (diff)").trim();
+            const diff = (process.env.DIFF_COVERAGE || "").trim();
+            const outcome = (process.env.DIFF_OUTCOME || "").trim();
+            const conclusion = conclusionFromOutcome(outcome);
+
+            let changedPyCount = null;
+            try {
+              const raw = (process.env.CHANGED_FILES_RAW || "").trim();
+              const arr = JSON.parse(raw || "[]");
+              if (Array.isArray(arr)) changedPyCount = arr.filter((f) => typeof f === "string" && f.endsWith(".py")).length;
+            } catch (_) {}
+
+            const hasDiff = diff.length > 0;
+            const title = hasDiff
+              ? `Diff coverage ${diff}% (target ${min}%)`
+              : (changedPyCount === 0 ? "Diff coverage: N/A (no Python files changed)" : "Diff coverage: unavailable");
+            const summary = hasDiff
+              ? `Diff coverage: **${diff}%**\n\nMinimum required: **${min}%**\n\nOutcome: **${outcome}**`
+              : `Diff coverage output was not produced.\n\nOutcome: **${outcome}**`;
+
+            await upsertCheck({ name, title, summary, conclusion });
+          }
+
+
